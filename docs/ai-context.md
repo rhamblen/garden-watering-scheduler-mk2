@@ -84,7 +84,7 @@ shared helpers (`garden_rain_cancel`, `garden_rain_threshold`, `garden_last_rain
 `garden_winter_shutdown`).
 
 ## Helpers
-50 per-schedule (25 × A/B) + 4 shared. The only difference from mk1 is
+50 per-schedule helpers total (25 each for A and B) + 4 shared. The only difference from mk1 is
 `garden_X_run_started` → `garden_X_run_end`. No `timer.*` helpers here — timers belong
 to the valve card and are derived by convention.
 

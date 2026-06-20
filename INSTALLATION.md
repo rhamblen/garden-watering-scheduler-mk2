@@ -17,7 +17,7 @@ If you use Claude with Home Assistant access, paste this:
 > https://github.com/rhamblen/garden-watering-scheduler-mk2 for context. First confirm
 > each valve I want to schedule has its `timer.<prefix>_timer` helper and a
 > `timer.finished` auto-close automation (the Zigbee Smart Water Valve card contract).
-> Then create the 50 per-schedule helpers + 4 shared helpers, install
+> Then create the 50 per-schedule helpers (25 each for A and B) + 4 shared helpers, install
 > `scripts.yaml`, `schedule-automations.yaml`, and `rain-automations.yaml`, discover my
 > `weather.*` forecast entity and wire it into the rain automations, and add
 > `card-a.yaml` and `card-b.yaml` to my dashboard.
@@ -75,6 +75,49 @@ valves during the transition.
 
 ---
 
+## Adding another schedule (the second tile, and beyond)
+
+> ### ⚠️ Do not duplicate the card
+> A second copy of the **same** card is **not** a second schedule. Every copy reads and writes the
+> same `garden_a_*` helpers, so two copies control **one** schedule — change the days on one and they
+> change on the other, and their client-side countdowns fight over the one `window.gwsT_a` global. An
+> independent schedule needs its **own namespaced helpers**, its **own card** (with its own
+> `window.gwsT_*`), and — for a third schedule onward — its **own** script + automation.
+
+mk2 ships **two** schedules: `card-a.yaml` (`garden_a_*`) and `card-b.yaml` (`garden_b_*`), and
+`scripts.yaml` / `schedule-automations.yaml` already define **both** A and B. Per-schedule state
+(days, start time, valve slots 1–5, armed, `run_end`) is namespaced; the rain helpers/automations and
+`garden_winter_shutdown` stay **shared** house-wide (winterise once → all schedules suspended; one
+rain skip → all schedules skip). Overlapping runs follow the FIFO single-valve cap.
+
+### Schedule B — the second tile
+
+If you added `card-b.yaml` in the base install, B is already live — just configure it on the **(B)**
+card. To add B to an A-only install:
+
+- **Ask Claude:** *"Add the second schedule (B) to my Garden Watering Scheduler mk2 — create the 25
+  `garden_b_*` helpers and add `card-b.yaml` next to my A card. `scripts.yaml` and
+  `schedule-automations.yaml` already include B. Keep rain cancel and winterise shared."*
+- **Manual:**
+  1. Create the 25 `garden_b_*` helpers ([helpers.md](helpers.md)). Populate each
+     `garden_b_valve_N_entity` (+ `_name`) for every zone you want to appear — a blank entity renders
+     no zone row; durations/days can start at 0/off until you set them on the card.
+  2. Add a second Manual card with `card-b.yaml`. It already uses `garden_b_*` and `window.gwsT_b`, so
+     **never hand-copy A's content for B** or the two countdowns will fight over one timer global.
+
+  `scripts.yaml` and `schedule-automations.yaml` already contain the B objects, so nothing else to do.
+
+### A third schedule (C) and beyond
+
+Repeat for a `garden_c_*` namespace: create 25 `garden_c_*` helpers, clone a sequence script and a
+schedule automation into the `c` namespace, and add a `card-c.yaml` (find-replace `garden_a_` →
+`garden_c_`, `window.gwsT_a` → `window.gwsT_c`, and the title). The **only** cross-schedule edits:
+extend the cap-guard namespace list `['a','b']` → `['a','b','c']` in **every** sequence script, and
+add `'c'` to the two templated rain automations (auto-cancel check + daily reset). For ~4+ schedules,
+graduate to a parameterised "schedule slot" model instead of named clones.
+
+---
+
 ## Troubleshooting
 
 - **A zone is skipped** — the single-valve cap saw another garden valve already `on`
@@ -88,3 +131,6 @@ valves during the transition.
   can be undone by auto-reopen. **Don't schedule a valve that is mid-pool-fill.**
 - **Countdown looks off after a manual early close** — it self-corrects at the next
   zone boundary (when `run_end` is re-stamped).
+- **Two cards change together / their countdowns fight** — you copied a card instead of using a
+  namespaced one. Each schedule needs its own `garden_X_*` helpers and its own card; use `card-b.yaml`
+  (it uses `garden_b_*` + `window.gwsT_b`), never a hand-copy of card A. See *Adding another schedule*.
