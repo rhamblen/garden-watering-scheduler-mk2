@@ -1,0 +1,670 @@
+# Garden Watering Scheduler mk2 — Sequence scripts (A & B) — OFFLOAD ENGINE
+# Repository: https://github.com/rhamblen/garden-watering-scheduler-mk2
+# =========================================================================
+# This is the heart of mk2 and the ONLY substantive difference from mk1.
+#
+# mk1 ran each zone with a self-managed delay:
+#     turn_on valve -> delay: N min -> turn_off valve -> 10 s settle
+#
+# mk2 OFFLOADS the close to the Zigbee valve card's own timer:
+#     turn_on valve
+#     timer.start  timer.{prefix}_timer  (duration = N min)   <- valve card closes it
+#     wait until the valve reports 'on'  (handles Zigbee report lag)
+#     wait until the valve reports 'off' (the valve card's timer.finished automation,
+#                                         OR a volume cutoff, OR manual Stop, OR a fault)
+#     [backstop] if it is somehow still on after the timeout, force-close it ourselves
+#
+# WHY wait on the valve going 'off' (not on timer.finished):
+#   The zone advances no matter WHAT closed the valve. The valve card's volume
+#   safety cutoff and any manual/fault close are inherited for free, and the
+#   close survives an HA restart (the timer helper is restore: true).
+#
+# NO 10 s SETTLE: mk1 needed a fixed sleep because it fired turn_off and moved on
+#   before HA had observed the Zigbee valve report 'off' (so the next zone's cap
+#   guard still saw it 'on' and skipped it — the mk1 v0.6.1 bug). mk2 advances on
+#   the actual '-> off' state, so the off-state is already registered when the next
+#   cap guard runs. The wait-for-state-change IS the settle, done correctly.
+#
+# SELF-CORRECTING COUNTDOWN: each zone re-stamps input_datetime.garden_X_run_end to
+#   now() + (sum of the remaining zones' durations). The card counts down to run_end,
+#   so a valve shut early (manual override or volume cutoff) makes the wait return
+#   immediately, the next zone re-stamps from now(), and the displayed total drops by
+#   the unused time. mk1's single run_started stamp could never self-correct.
+#
+# SINGLE-VALVE CAP (FIFO overlap policy) — carried over from mk1 unchanged:
+#   Before opening a zone, a guard checks NO garden valve is on anywhere across BOTH
+#   namespaces' *_valve_N_entity helpers. If one is on, the whole zone block is
+#   skipped — dropped for this run, never queued. First command wins; off always wins.
+#   The guard lists namespaces ['a','b']; extend it AND the sibling script for a C/D.
+#
+# TIMER ENTITY is derived by convention from the valve switch entity:
+#   switch.<prefix>  ->  timer.<prefix>_timer
+#   This is the integration contract the valve card guarantees (see
+#   docs/integration-contract.md). The backstop covers a valve that lacks the timer.
+#
+# Install as two scripts (Settings -> Automations & Scenes -> Scripts, or via the
+# HA API). Both are mode: single.
+# =========================================================================
+
+# -------------------------------------------------------------------------
+# SCHEDULE A — script.garden_a_watering_sequence
+# -------------------------------------------------------------------------
+garden_a_watering_sequence:
+  alias: Garden Watering Sequence A
+  description: >-
+    Schedule A. Opens each configured valve slot 1..5 in order, starts the valve's
+    own countdown timer for its set duration, and waits for the valve to close
+    (timer-finished, volume cutoff, manual, or fault) before moving on. Honours the
+    system-wide single-valve cap. Re-stamps garden_a_run_end each zone so the card
+    countdown self-corrects.
+  icon: mdi:sprinkler
+  mode: single
+  sequence:
+    # Step 0 — stamp the full projected end so the countdown is correct from t=0.
+    - action: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.garden_a_run_end
+      data:
+        timestamp: >-
+          {% set ns = namespace(s=0) %}
+          {% for n in [1,2,3,4,5] %}
+            {% set d = states('input_number.garden_a_valve_' ~ n ~ '_duration')|int(0) %}
+            {% if d > 0 %}{% set ns.s = ns.s + d*60 %}{% endif %}
+          {% endfor %}
+          {{ (now().timestamp()|int) + ns.s }}
+
+    # ----- SLOT 1 -----
+    - if:
+        - condition: numeric_state
+          entity_id: input_number.garden_a_valve_1_duration
+          above: 0
+        - condition: template
+          value_template: >-
+            {% set busy = namespace(any=false) %}
+            {% for nsp in ['a','b'] %}{% for n in [1,2,3,4,5] %}
+              {% set e = states('input_text.garden_' ~ nsp ~ '_valve_' ~ n ~ '_entity') %}
+              {% if e not in ['','unknown','unavailable'] and is_state(e,'on') %}{% set busy.any = true %}{% endif %}
+            {% endfor %}{% endfor %}
+            {{ not busy.any }}
+      then:
+        - variables:
+            sw: "{{ states('input_text.garden_a_valve_1_entity') }}"
+            tmr: "timer.{{ states('input_text.garden_a_valve_1_entity').split('.')[1] }}_timer"
+            secs: "{{ states('input_number.garden_a_valve_1_duration') | int(0) * 60 }}"
+        - action: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.garden_a_run_end
+          data:
+            timestamp: >-
+              {% set ns = namespace(s=0) %}
+              {% for n in [1,2,3,4,5] %}
+                {% set d = states('input_number.garden_a_valve_' ~ n ~ '_duration')|int(0) %}
+                {% if d > 0 %}{% set ns.s = ns.s + d*60 %}{% endif %}
+              {% endfor %}
+              {{ (now().timestamp()|int) + ns.s }}
+        - action: homeassistant.turn_on
+          data:
+            entity_id: "{{ sw }}"
+        - action: timer.start
+          target:
+            entity_id: "{{ tmr }}"
+          data:
+            duration: "{{ '%02d:%02d:%02d' % (secs // 3600, (secs % 3600) // 60, secs % 60) }}"
+        - wait_template: "{{ is_state(sw,'on') }}"
+          timeout: "30"
+          continue_on_timeout: true
+        - wait_template: "{{ is_state(sw,'off') }}"
+          timeout: "{{ secs + 30 }}"
+          continue_on_timeout: true
+        - if:
+            - condition: template
+              value_template: "{{ is_state(sw,'on') }}"
+          then:
+            - action: homeassistant.turn_off
+              data:
+                entity_id: "{{ sw }}"
+            - action: timer.cancel
+              target:
+                entity_id: "{{ tmr }}"
+            - wait_template: "{{ is_state(sw,'off') }}"
+              timeout: "15"
+              continue_on_timeout: true
+
+    # ----- SLOT 2 -----
+    - if:
+        - condition: numeric_state
+          entity_id: input_number.garden_a_valve_2_duration
+          above: 0
+        - condition: template
+          value_template: >-
+            {% set busy = namespace(any=false) %}
+            {% for nsp in ['a','b'] %}{% for n in [1,2,3,4,5] %}
+              {% set e = states('input_text.garden_' ~ nsp ~ '_valve_' ~ n ~ '_entity') %}
+              {% if e not in ['','unknown','unavailable'] and is_state(e,'on') %}{% set busy.any = true %}{% endif %}
+            {% endfor %}{% endfor %}
+            {{ not busy.any }}
+      then:
+        - variables:
+            sw: "{{ states('input_text.garden_a_valve_2_entity') }}"
+            tmr: "timer.{{ states('input_text.garden_a_valve_2_entity').split('.')[1] }}_timer"
+            secs: "{{ states('input_number.garden_a_valve_2_duration') | int(0) * 60 }}"
+        - action: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.garden_a_run_end
+          data:
+            timestamp: >-
+              {% set ns = namespace(s=0) %}
+              {% for n in [2,3,4,5] %}
+                {% set d = states('input_number.garden_a_valve_' ~ n ~ '_duration')|int(0) %}
+                {% if d > 0 %}{% set ns.s = ns.s + d*60 %}{% endif %}
+              {% endfor %}
+              {{ (now().timestamp()|int) + ns.s }}
+        - action: homeassistant.turn_on
+          data:
+            entity_id: "{{ sw }}"
+        - action: timer.start
+          target:
+            entity_id: "{{ tmr }}"
+          data:
+            duration: "{{ '%02d:%02d:%02d' % (secs // 3600, (secs % 3600) // 60, secs % 60) }}"
+        - wait_template: "{{ is_state(sw,'on') }}"
+          timeout: "30"
+          continue_on_timeout: true
+        - wait_template: "{{ is_state(sw,'off') }}"
+          timeout: "{{ secs + 30 }}"
+          continue_on_timeout: true
+        - if:
+            - condition: template
+              value_template: "{{ is_state(sw,'on') }}"
+          then:
+            - action: homeassistant.turn_off
+              data:
+                entity_id: "{{ sw }}"
+            - action: timer.cancel
+              target:
+                entity_id: "{{ tmr }}"
+            - wait_template: "{{ is_state(sw,'off') }}"
+              timeout: "15"
+              continue_on_timeout: true
+
+    # ----- SLOT 3 -----
+    - if:
+        - condition: numeric_state
+          entity_id: input_number.garden_a_valve_3_duration
+          above: 0
+        - condition: template
+          value_template: >-
+            {% set busy = namespace(any=false) %}
+            {% for nsp in ['a','b'] %}{% for n in [1,2,3,4,5] %}
+              {% set e = states('input_text.garden_' ~ nsp ~ '_valve_' ~ n ~ '_entity') %}
+              {% if e not in ['','unknown','unavailable'] and is_state(e,'on') %}{% set busy.any = true %}{% endif %}
+            {% endfor %}{% endfor %}
+            {{ not busy.any }}
+      then:
+        - variables:
+            sw: "{{ states('input_text.garden_a_valve_3_entity') }}"
+            tmr: "timer.{{ states('input_text.garden_a_valve_3_entity').split('.')[1] }}_timer"
+            secs: "{{ states('input_number.garden_a_valve_3_duration') | int(0) * 60 }}"
+        - action: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.garden_a_run_end
+          data:
+            timestamp: >-
+              {% set ns = namespace(s=0) %}
+              {% for n in [3,4,5] %}
+                {% set d = states('input_number.garden_a_valve_' ~ n ~ '_duration')|int(0) %}
+                {% if d > 0 %}{% set ns.s = ns.s + d*60 %}{% endif %}
+              {% endfor %}
+              {{ (now().timestamp()|int) + ns.s }}
+        - action: homeassistant.turn_on
+          data:
+            entity_id: "{{ sw }}"
+        - action: timer.start
+          target:
+            entity_id: "{{ tmr }}"
+          data:
+            duration: "{{ '%02d:%02d:%02d' % (secs // 3600, (secs % 3600) // 60, secs % 60) }}"
+        - wait_template: "{{ is_state(sw,'on') }}"
+          timeout: "30"
+          continue_on_timeout: true
+        - wait_template: "{{ is_state(sw,'off') }}"
+          timeout: "{{ secs + 30 }}"
+          continue_on_timeout: true
+        - if:
+            - condition: template
+              value_template: "{{ is_state(sw,'on') }}"
+          then:
+            - action: homeassistant.turn_off
+              data:
+                entity_id: "{{ sw }}"
+            - action: timer.cancel
+              target:
+                entity_id: "{{ tmr }}"
+            - wait_template: "{{ is_state(sw,'off') }}"
+              timeout: "15"
+              continue_on_timeout: true
+
+    # ----- SLOT 4 -----
+    - if:
+        - condition: numeric_state
+          entity_id: input_number.garden_a_valve_4_duration
+          above: 0
+        - condition: template
+          value_template: >-
+            {% set busy = namespace(any=false) %}
+            {% for nsp in ['a','b'] %}{% for n in [1,2,3,4,5] %}
+              {% set e = states('input_text.garden_' ~ nsp ~ '_valve_' ~ n ~ '_entity') %}
+              {% if e not in ['','unknown','unavailable'] and is_state(e,'on') %}{% set busy.any = true %}{% endif %}
+            {% endfor %}{% endfor %}
+            {{ not busy.any }}
+      then:
+        - variables:
+            sw: "{{ states('input_text.garden_a_valve_4_entity') }}"
+            tmr: "timer.{{ states('input_text.garden_a_valve_4_entity').split('.')[1] }}_timer"
+            secs: "{{ states('input_number.garden_a_valve_4_duration') | int(0) * 60 }}"
+        - action: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.garden_a_run_end
+          data:
+            timestamp: >-
+              {% set ns = namespace(s=0) %}
+              {% for n in [4,5] %}
+                {% set d = states('input_number.garden_a_valve_' ~ n ~ '_duration')|int(0) %}
+                {% if d > 0 %}{% set ns.s = ns.s + d*60 %}{% endif %}
+              {% endfor %}
+              {{ (now().timestamp()|int) + ns.s }}
+        - action: homeassistant.turn_on
+          data:
+            entity_id: "{{ sw }}"
+        - action: timer.start
+          target:
+            entity_id: "{{ tmr }}"
+          data:
+            duration: "{{ '%02d:%02d:%02d' % (secs // 3600, (secs % 3600) // 60, secs % 60) }}"
+        - wait_template: "{{ is_state(sw,'on') }}"
+          timeout: "30"
+          continue_on_timeout: true
+        - wait_template: "{{ is_state(sw,'off') }}"
+          timeout: "{{ secs + 30 }}"
+          continue_on_timeout: true
+        - if:
+            - condition: template
+              value_template: "{{ is_state(sw,'on') }}"
+          then:
+            - action: homeassistant.turn_off
+              data:
+                entity_id: "{{ sw }}"
+            - action: timer.cancel
+              target:
+                entity_id: "{{ tmr }}"
+            - wait_template: "{{ is_state(sw,'off') }}"
+              timeout: "15"
+              continue_on_timeout: true
+
+    # ----- SLOT 5 -----
+    - if:
+        - condition: numeric_state
+          entity_id: input_number.garden_a_valve_5_duration
+          above: 0
+        - condition: template
+          value_template: >-
+            {% set busy = namespace(any=false) %}
+            {% for nsp in ['a','b'] %}{% for n in [1,2,3,4,5] %}
+              {% set e = states('input_text.garden_' ~ nsp ~ '_valve_' ~ n ~ '_entity') %}
+              {% if e not in ['','unknown','unavailable'] and is_state(e,'on') %}{% set busy.any = true %}{% endif %}
+            {% endfor %}{% endfor %}
+            {{ not busy.any }}
+      then:
+        - variables:
+            sw: "{{ states('input_text.garden_a_valve_5_entity') }}"
+            tmr: "timer.{{ states('input_text.garden_a_valve_5_entity').split('.')[1] }}_timer"
+            secs: "{{ states('input_number.garden_a_valve_5_duration') | int(0) * 60 }}"
+        - action: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.garden_a_run_end
+          data:
+            timestamp: >-
+              {% set ns = namespace(s=0) %}
+              {% for n in [5] %}
+                {% set d = states('input_number.garden_a_valve_' ~ n ~ '_duration')|int(0) %}
+                {% if d > 0 %}{% set ns.s = ns.s + d*60 %}{% endif %}
+              {% endfor %}
+              {{ (now().timestamp()|int) + ns.s }}
+        - action: homeassistant.turn_on
+          data:
+            entity_id: "{{ sw }}"
+        - action: timer.start
+          target:
+            entity_id: "{{ tmr }}"
+          data:
+            duration: "{{ '%02d:%02d:%02d' % (secs // 3600, (secs % 3600) // 60, secs % 60) }}"
+        - wait_template: "{{ is_state(sw,'on') }}"
+          timeout: "30"
+          continue_on_timeout: true
+        - wait_template: "{{ is_state(sw,'off') }}"
+          timeout: "{{ secs + 30 }}"
+          continue_on_timeout: true
+        - if:
+            - condition: template
+              value_template: "{{ is_state(sw,'on') }}"
+          then:
+            - action: homeassistant.turn_off
+              data:
+                entity_id: "{{ sw }}"
+            - action: timer.cancel
+              target:
+                entity_id: "{{ tmr }}"
+            - wait_template: "{{ is_state(sw,'off') }}"
+              timeout: "15"
+              continue_on_timeout: true
+
+# -------------------------------------------------------------------------
+# SCHEDULE B — script.garden_b_watering_sequence
+# (identical to A, garden_b_* namespace; same shared cap guard ['a','b'])
+# -------------------------------------------------------------------------
+garden_b_watering_sequence:
+  alias: Garden Watering Sequence B
+  description: >-
+    Schedule B. Opens each configured valve slot 1..5 in order, starts the valve's
+    own countdown timer, and waits for the valve to close before moving on. Honours
+    the system-wide single-valve cap. Re-stamps garden_b_run_end each zone so the
+    card countdown self-corrects.
+  icon: mdi:sprinkler
+  mode: single
+  sequence:
+    - action: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.garden_b_run_end
+      data:
+        timestamp: >-
+          {% set ns = namespace(s=0) %}
+          {% for n in [1,2,3,4,5] %}
+            {% set d = states('input_number.garden_b_valve_' ~ n ~ '_duration')|int(0) %}
+            {% if d > 0 %}{% set ns.s = ns.s + d*60 %}{% endif %}
+          {% endfor %}
+          {{ (now().timestamp()|int) + ns.s }}
+
+    # ----- SLOT 1 -----
+    - if:
+        - condition: numeric_state
+          entity_id: input_number.garden_b_valve_1_duration
+          above: 0
+        - condition: template
+          value_template: >-
+            {% set busy = namespace(any=false) %}
+            {% for nsp in ['a','b'] %}{% for n in [1,2,3,4,5] %}
+              {% set e = states('input_text.garden_' ~ nsp ~ '_valve_' ~ n ~ '_entity') %}
+              {% if e not in ['','unknown','unavailable'] and is_state(e,'on') %}{% set busy.any = true %}{% endif %}
+            {% endfor %}{% endfor %}
+            {{ not busy.any }}
+      then:
+        - variables:
+            sw: "{{ states('input_text.garden_b_valve_1_entity') }}"
+            tmr: "timer.{{ states('input_text.garden_b_valve_1_entity').split('.')[1] }}_timer"
+            secs: "{{ states('input_number.garden_b_valve_1_duration') | int(0) * 60 }}"
+        - action: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.garden_b_run_end
+          data:
+            timestamp: >-
+              {% set ns = namespace(s=0) %}
+              {% for n in [1,2,3,4,5] %}
+                {% set d = states('input_number.garden_b_valve_' ~ n ~ '_duration')|int(0) %}
+                {% if d > 0 %}{% set ns.s = ns.s + d*60 %}{% endif %}
+              {% endfor %}
+              {{ (now().timestamp()|int) + ns.s }}
+        - action: homeassistant.turn_on
+          data:
+            entity_id: "{{ sw }}"
+        - action: timer.start
+          target:
+            entity_id: "{{ tmr }}"
+          data:
+            duration: "{{ '%02d:%02d:%02d' % (secs // 3600, (secs % 3600) // 60, secs % 60) }}"
+        - wait_template: "{{ is_state(sw,'on') }}"
+          timeout: "30"
+          continue_on_timeout: true
+        - wait_template: "{{ is_state(sw,'off') }}"
+          timeout: "{{ secs + 30 }}"
+          continue_on_timeout: true
+        - if:
+            - condition: template
+              value_template: "{{ is_state(sw,'on') }}"
+          then:
+            - action: homeassistant.turn_off
+              data:
+                entity_id: "{{ sw }}"
+            - action: timer.cancel
+              target:
+                entity_id: "{{ tmr }}"
+            - wait_template: "{{ is_state(sw,'off') }}"
+              timeout: "15"
+              continue_on_timeout: true
+
+    # ----- SLOT 2 -----
+    - if:
+        - condition: numeric_state
+          entity_id: input_number.garden_b_valve_2_duration
+          above: 0
+        - condition: template
+          value_template: >-
+            {% set busy = namespace(any=false) %}
+            {% for nsp in ['a','b'] %}{% for n in [1,2,3,4,5] %}
+              {% set e = states('input_text.garden_' ~ nsp ~ '_valve_' ~ n ~ '_entity') %}
+              {% if e not in ['','unknown','unavailable'] and is_state(e,'on') %}{% set busy.any = true %}{% endif %}
+            {% endfor %}{% endfor %}
+            {{ not busy.any }}
+      then:
+        - variables:
+            sw: "{{ states('input_text.garden_b_valve_2_entity') }}"
+            tmr: "timer.{{ states('input_text.garden_b_valve_2_entity').split('.')[1] }}_timer"
+            secs: "{{ states('input_number.garden_b_valve_2_duration') | int(0) * 60 }}"
+        - action: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.garden_b_run_end
+          data:
+            timestamp: >-
+              {% set ns = namespace(s=0) %}
+              {% for n in [2,3,4,5] %}
+                {% set d = states('input_number.garden_b_valve_' ~ n ~ '_duration')|int(0) %}
+                {% if d > 0 %}{% set ns.s = ns.s + d*60 %}{% endif %}
+              {% endfor %}
+              {{ (now().timestamp()|int) + ns.s }}
+        - action: homeassistant.turn_on
+          data:
+            entity_id: "{{ sw }}"
+        - action: timer.start
+          target:
+            entity_id: "{{ tmr }}"
+          data:
+            duration: "{{ '%02d:%02d:%02d' % (secs // 3600, (secs % 3600) // 60, secs % 60) }}"
+        - wait_template: "{{ is_state(sw,'on') }}"
+          timeout: "30"
+          continue_on_timeout: true
+        - wait_template: "{{ is_state(sw,'off') }}"
+          timeout: "{{ secs + 30 }}"
+          continue_on_timeout: true
+        - if:
+            - condition: template
+              value_template: "{{ is_state(sw,'on') }}"
+          then:
+            - action: homeassistant.turn_off
+              data:
+                entity_id: "{{ sw }}"
+            - action: timer.cancel
+              target:
+                entity_id: "{{ tmr }}"
+            - wait_template: "{{ is_state(sw,'off') }}"
+              timeout: "15"
+              continue_on_timeout: true
+
+    # ----- SLOT 3 -----
+    - if:
+        - condition: numeric_state
+          entity_id: input_number.garden_b_valve_3_duration
+          above: 0
+        - condition: template
+          value_template: >-
+            {% set busy = namespace(any=false) %}
+            {% for nsp in ['a','b'] %}{% for n in [1,2,3,4,5] %}
+              {% set e = states('input_text.garden_' ~ nsp ~ '_valve_' ~ n ~ '_entity') %}
+              {% if e not in ['','unknown','unavailable'] and is_state(e,'on') %}{% set busy.any = true %}{% endif %}
+            {% endfor %}{% endfor %}
+            {{ not busy.any }}
+      then:
+        - variables:
+            sw: "{{ states('input_text.garden_b_valve_3_entity') }}"
+            tmr: "timer.{{ states('input_text.garden_b_valve_3_entity').split('.')[1] }}_timer"
+            secs: "{{ states('input_number.garden_b_valve_3_duration') | int(0) * 60 }}"
+        - action: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.garden_b_run_end
+          data:
+            timestamp: >-
+              {% set ns = namespace(s=0) %}
+              {% for n in [3,4,5] %}
+                {% set d = states('input_number.garden_b_valve_' ~ n ~ '_duration')|int(0) %}
+                {% if d > 0 %}{% set ns.s = ns.s + d*60 %}{% endif %}
+              {% endfor %}
+              {{ (now().timestamp()|int) + ns.s }}
+        - action: homeassistant.turn_on
+          data:
+            entity_id: "{{ sw }}"
+        - action: timer.start
+          target:
+            entity_id: "{{ tmr }}"
+          data:
+            duration: "{{ '%02d:%02d:%02d' % (secs // 3600, (secs % 3600) // 60, secs % 60) }}"
+        - wait_template: "{{ is_state(sw,'on') }}"
+          timeout: "30"
+          continue_on_timeout: true
+        - wait_template: "{{ is_state(sw,'off') }}"
+          timeout: "{{ secs + 30 }}"
+          continue_on_timeout: true
+        - if:
+            - condition: template
+              value_template: "{{ is_state(sw,'on') }}"
+          then:
+            - action: homeassistant.turn_off
+              data:
+                entity_id: "{{ sw }}"
+            - action: timer.cancel
+              target:
+                entity_id: "{{ tmr }}"
+            - wait_template: "{{ is_state(sw,'off') }}"
+              timeout: "15"
+              continue_on_timeout: true
+
+    # ----- SLOT 4 -----
+    - if:
+        - condition: numeric_state
+          entity_id: input_number.garden_b_valve_4_duration
+          above: 0
+        - condition: template
+          value_template: >-
+            {% set busy = namespace(any=false) %}
+            {% for nsp in ['a','b'] %}{% for n in [1,2,3,4,5] %}
+              {% set e = states('input_text.garden_' ~ nsp ~ '_valve_' ~ n ~ '_entity') %}
+              {% if e not in ['','unknown','unavailable'] and is_state(e,'on') %}{% set busy.any = true %}{% endif %}
+            {% endfor %}{% endfor %}
+            {{ not busy.any }}
+      then:
+        - variables:
+            sw: "{{ states('input_text.garden_b_valve_4_entity') }}"
+            tmr: "timer.{{ states('input_text.garden_b_valve_4_entity').split('.')[1] }}_timer"
+            secs: "{{ states('input_number.garden_b_valve_4_duration') | int(0) * 60 }}"
+        - action: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.garden_b_run_end
+          data:
+            timestamp: >-
+              {% set ns = namespace(s=0) %}
+              {% for n in [4,5] %}
+                {% set d = states('input_number.garden_b_valve_' ~ n ~ '_duration')|int(0) %}
+                {% if d > 0 %}{% set ns.s = ns.s + d*60 %}{% endif %}
+              {% endfor %}
+              {{ (now().timestamp()|int) + ns.s }}
+        - action: homeassistant.turn_on
+          data:
+            entity_id: "{{ sw }}"
+        - action: timer.start
+          target:
+            entity_id: "{{ tmr }}"
+          data:
+            duration: "{{ '%02d:%02d:%02d' % (secs // 3600, (secs % 3600) // 60, secs % 60) }}"
+        - wait_template: "{{ is_state(sw,'on') }}"
+          timeout: "30"
+          continue_on_timeout: true
+        - wait_template: "{{ is_state(sw,'off') }}"
+          timeout: "{{ secs + 30 }}"
+          continue_on_timeout: true
+        - if:
+            - condition: template
+              value_template: "{{ is_state(sw,'on') }}"
+          then:
+            - action: homeassistant.turn_off
+              data:
+                entity_id: "{{ sw }}"
+            - action: timer.cancel
+              target:
+                entity_id: "{{ tmr }}"
+            - wait_template: "{{ is_state(sw,'off') }}"
+              timeout: "15"
+              continue_on_timeout: true
+
+    # ----- SLOT 5 -----
+    - if:
+        - condition: numeric_state
+          entity_id: input_number.garden_b_valve_5_duration
+          above: 0
+        - condition: template
+          value_template: >-
+            {% set busy = namespace(any=false) %}
+            {% for nsp in ['a','b'] %}{% for n in [1,2,3,4,5] %}
+              {% set e = states('input_text.garden_' ~ nsp ~ '_valve_' ~ n ~ '_entity') %}
+              {% if e not in ['','unknown','unavailable'] and is_state(e,'on') %}{% set busy.any = true %}{% endif %}
+            {% endfor %}{% endfor %}
+            {{ not busy.any }}
+      then:
+        - variables:
+            sw: "{{ states('input_text.garden_b_valve_5_entity') }}"
+            tmr: "timer.{{ states('input_text.garden_b_valve_5_entity').split('.')[1] }}_timer"
+            secs: "{{ states('input_number.garden_b_valve_5_duration') | int(0) * 60 }}"
+        - action: input_datetime.set_datetime
+          target:
+            entity_id: input_datetime.garden_b_run_end
+          data:
+            timestamp: >-
+              {% set ns = namespace(s=0) %}
+              {% for n in [5] %}
+                {% set d = states('input_number.garden_b_valve_' ~ n ~ '_duration')|int(0) %}
+                {% if d > 0 %}{% set ns.s = ns.s + d*60 %}{% endif %}
+              {% endfor %}
+              {{ (now().timestamp()|int) + ns.s }}
+        - action: homeassistant.turn_on
+          data:
+            entity_id: "{{ sw }}"
+        - action: timer.start
+          target:
+            entity_id: "{{ tmr }}"
+          data:
+            duration: "{{ '%02d:%02d:%02d' % (secs // 3600, (secs % 3600) // 60, secs % 60) }}"
+        - wait_template: "{{ is_state(sw,'on') }}"
+          timeout: "30"
+          continue_on_timeout: true
+        - wait_template: "{{ is_state(sw,'off') }}"
+          timeout: "{{ secs + 30 }}"
+          continue_on_timeout: true
+        - if:
+            - condition: template
+              value_template: "{{ is_state(sw,'on') }}"
+          then:
+            - action: homeassistant.turn_off
+              data:
+                entity_id: "{{ sw }}"
+            - action: timer.cancel
+              target:
+                entity_id: "{{ tmr }}"
+            - wait_template: "{{ is_state(sw,'off') }}"
+              timeout: "15"
+              continue_on_timeout: true

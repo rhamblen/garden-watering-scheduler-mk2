@@ -1,0 +1,97 @@
+# Garden Watering Scheduler — Multi-schedule trigger automations (A & B)
+# Repository: https://github.com/rhamblen/garden-watering-scheduler-mk2
+# =========================================================================
+# One schedule automation per independent schedule. Each is the namespaced
+# clone of the single-schedule automation.garden_watering_schedule, calling
+# its own sequence script.
+#
+# CHANGE vs single-schedule: an explicit
+#       input_boolean.garden_winter_shutdown == off
+# condition is added to BOTH. In the single-schedule design, ❄ Winterise simply
+# disarmed the one schedule, so no winter condition was needed. With per-schedule
+# armed flags, ❄ on card A would not disarm B — so the condition makes the shared
+# ❄ flag suspend EVERY schedule regardless of each card's armed state
+# ("winterise once, holds across all schedules" — see design doc).
+#
+# rain_cancel and winter_shutdown stay the SHARED house-wide helpers (a rain skip
+# or winterise applies to both schedules). Each automation's armed / start-time /
+# day checks reference its OWN garden_X_* helpers.
+#
+# Install as two automations (or append to automations.yaml). Both mode: single.
+# =========================================================================
+
+# -------------------------------------------------------------------------
+# SCHEDULE A
+# -------------------------------------------------------------------------
+- id: garden_a_watering_schedule
+  alias: Garden Watering Schedule A
+  description: >-
+    Fires at every :00 and :30; runs schedule A's sequence when A is armed, not
+    rained-off, not winterised, and the current time/day match A's settings.
+  mode: single
+  triggers:
+    - trigger: time_pattern
+      minutes: "0"
+    - trigger: time_pattern
+      minutes: "30"
+  conditions:
+    - condition: state
+      entity_id: input_boolean.garden_a_schedule_armed
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.garden_rain_cancel
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.garden_winter_shutdown
+      state: "off"
+    - condition: template
+      value_template: >-
+        {{ now().strftime('%H:%M') == states('input_select.garden_a_water_start_time') }}
+    - condition: template
+      value_template: >-
+        {% set dow = now().weekday() %}
+        {% set days = ['input_boolean.garden_a_water_mon','input_boolean.garden_a_water_tue',
+                       'input_boolean.garden_a_water_wed','input_boolean.garden_a_water_thu',
+                       'input_boolean.garden_a_water_fri','input_boolean.garden_a_water_sat',
+                       'input_boolean.garden_a_water_sun'] %}
+        {{ is_state(days[dow], 'on') }}
+  actions:
+    - action: script.garden_a_watering_sequence
+
+# -------------------------------------------------------------------------
+# SCHEDULE B
+# -------------------------------------------------------------------------
+- id: garden_b_watering_schedule
+  alias: Garden Watering Schedule B
+  description: >-
+    Fires at every :00 and :30; runs schedule B's sequence when B is armed, not
+    rained-off, not winterised, and the current time/day match B's settings.
+  mode: single
+  triggers:
+    - trigger: time_pattern
+      minutes: "0"
+    - trigger: time_pattern
+      minutes: "30"
+  conditions:
+    - condition: state
+      entity_id: input_boolean.garden_b_schedule_armed
+      state: "on"
+    - condition: state
+      entity_id: input_boolean.garden_rain_cancel
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.garden_winter_shutdown
+      state: "off"
+    - condition: template
+      value_template: >-
+        {{ now().strftime('%H:%M') == states('input_select.garden_b_water_start_time') }}
+    - condition: template
+      value_template: >-
+        {% set dow = now().weekday() %}
+        {% set days = ['input_boolean.garden_b_water_mon','input_boolean.garden_b_water_tue',
+                       'input_boolean.garden_b_water_wed','input_boolean.garden_b_water_thu',
+                       'input_boolean.garden_b_water_fri','input_boolean.garden_b_water_sat',
+                       'input_boolean.garden_b_water_sun'] %}
+        {{ is_state(days[dow], 'on') }}
+  actions:
+    - action: script.garden_b_watering_sequence

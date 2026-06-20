@@ -1,0 +1,7 @@
+{
+  "name": "Garden Watering Scheduler mk2 Card",
+  "description": "Home Assistant scheduler card that OFFLOADS each zone's close to the Zigbee Smart Water Valve card's own countdown timer — sequential 1–5 zone watering, two independent schedules, self-correcting countdown, single-valve cap, automatic rain cancel, and winter shutdown. Requires the Zigbee valve tiles.",
+  "render_readme": true,
+  "content_in_root": true,
+  "filename": "card-a.yaml"
+}

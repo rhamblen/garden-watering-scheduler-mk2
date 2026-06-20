@@ -1,0 +1,193 @@
+# Garden Watering Scheduler — Rain-cancel automations (multi-schedule build)
+# Repository: https://github.com/rhamblen/garden-watering-scheduler-mk2
+# =========================================================================
+# These REPLACE the single-schedule v0.4.0 rain automations (root
+# automations.yaml) when you move to multi-schedule. Rain stays a SINGLE
+# SHARED skip: if it rained / is forecast, BOTH schedules skip today.
+#
+# What changed from single-schedule (and WHY):
+#   • RECORDER — unchanged. It only watches the weather entity, no schedule
+#     helper, so it needs no namespacing.
+#   • AUTO-CANCEL CHECK — the "is a run due in 30 min?" gate is now an OR across
+#     BOTH schedules (A and B each have their own armed flag, start time, and
+#     day toggles). It fires 30 min before EITHER schedule's start. It still only
+#     ever turns the shared flag ON.
+#   • DAILY RESET — now clears the shared flag 30 min after the LATEST of the two
+#     start times, so a rainy day skips BOTH the early and the late run before
+#     the flag clears. (If the two schedules run far apart, the skip correctly
+#     holds across the whole day.)
+#
+# ┌─ WEATHER PROVIDER ─────────────────────────────────────────────────────┐
+# │ Replace  weather.YOUR_FORECAST_ENTITY  in the TWO  # << SET WEATHER     │
+# │ ENTITY  spots (recorder trigger + get_forecasts target). Must support    │
+# │ hourly forecasts. The probability-scan template is provider-agnostic.    │
+# └────────────────────────────────────────────────────────────────────────┘
+#
+# Shared helper unchanged:  input_datetime.garden_last_rain  (seed to an old
+# value, e.g. 2020-01-01 00:00). Shared:  input_number.garden_rain_threshold,
+# input_boolean.garden_rain_cancel.
+# =========================================================================
+
+# -------------------------------------------------------------------------
+# 1. RECORDER — stamps the last time it ACTUALLY started raining. UNCHANGED.
+# -------------------------------------------------------------------------
+- id: garden_rain_recorder
+  alias: Garden Rain Recorder
+  description: >-
+    Stamps input_datetime.garden_last_rain whenever the weather condition
+    enters a rain state. Feeds the 12 h "rained recently" lookback. Shared
+    across all schedules.
+  mode: single
+  triggers:
+    - trigger: state
+      entity_id: weather.YOUR_FORECAST_ENTITY   # << SET WEATHER ENTITY (actual rain)
+      to:
+        - rainy
+        - pouring
+        - lightning-rainy
+        - snowy-rainy
+        - hail
+  conditions: []
+  actions:
+    - action: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.garden_last_rain
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+# -------------------------------------------------------------------------
+# 2. AUTO-CANCEL CHECK — 30 min before EITHER schedule's start.
+#    Cancels today's runs if it rained in the last 12 h OR rain is forecast
+#    (probability) in the next 24 h, then posts a notification.
+# -------------------------------------------------------------------------
+- id: garden_rain_auto_cancel_check
+  alias: Garden Rain Auto-Cancel Check
+  description: >-
+    30 min before any armed schedule's start, cancels today's watering if it
+    rained in the last 12 h (actual) OR rain is forecast in the next 24 h
+    (hourly precipitation_probability >= garden_rain_threshold). Sets the
+    shared garden_rain_cancel and posts a persistent notification.
+  mode: single
+  triggers:
+    - trigger: time_pattern
+      minutes: "0"
+    - trigger: time_pattern
+      minutes: "30"
+  conditions:
+    # Shared house-wide gates.
+    - condition: state
+      entity_id: input_boolean.garden_winter_shutdown
+      state: "off"
+    - condition: state
+      entity_id: input_boolean.garden_rain_cancel
+      state: "off"
+    # A run is due in 30 min for AT LEAST ONE schedule (armed + start-time +
+    # the run-day enabled). OR across schedules A and B.
+    - condition: template
+      value_template: >-
+        {% set t = now() + timedelta(minutes=30) %}
+        {% set hm = t.strftime('%H:%M') %}
+        {% set days = ['mon','tue','wed','thu','fri','sat','sun'] %}
+        {% set day = days[t.weekday()] %}
+        {% set ns = namespace(due=false) %}
+        {% for s in ['a','b'] %}
+          {% set armed = is_state('input_boolean.garden_' ~ s ~ '_schedule_armed','on') %}
+          {% set sttime = states('input_select.garden_' ~ s ~ '_water_start_time') %}
+          {% set dayon = is_state('input_boolean.garden_' ~ s ~ '_water_' ~ day,'on') %}
+          {% if armed and hm == sttime and dayon %}{% set ns.due = true %}{% endif %}
+        {% endfor %}
+        {{ ns.due }}
+  actions:
+    # FORECAST source — hourly forecast for the next ~48 h.
+    - action: weather.get_forecasts
+      target:
+        entity_id: weather.YOUR_FORECAST_ENTITY   # << SET WEATHER ENTITY (forecast)
+      data:
+        type: hourly
+      response_variable: fc
+    - variables:
+        threshold: "{{ states('input_number.garden_rain_threshold') | int(60) }}"
+        # Max precipitation_probability over hours within the next 24 h.
+        # Provider-agnostic: reads the single forecast list regardless of the
+        # weather entity's id, so no edit is needed inside this template.
+        max_prob: >-
+          {% set fcs = fc.values() | list %}
+          {% set items = (fcs | first).forecast if fcs else [] %}
+          {% set cutoff = now() + timedelta(hours=24) %}
+          {% set ns = namespace(maxp=0) %}
+          {% for f in items %}
+            {% if as_datetime(f.datetime) <= cutoff
+                  and f.precipitation_probability is not none
+                  and f.precipitation_probability > ns.maxp %}
+              {% set ns.maxp = f.precipitation_probability %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.maxp }}
+        last_rain: "{{ states('input_datetime.garden_last_rain') }}"
+        # ACTUAL: did it start raining within the last 12 h (43200 s)?
+        rained_recently: >-
+          {{ last_rain not in ['unknown','unavailable','']
+             and (as_timestamp(now()) - as_timestamp(last_rain, 0)) < 43200 }}
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ rained_recently or (max_prob | int) >= (threshold | int) }}"
+          sequence:
+            - action: input_boolean.turn_on
+              target:
+                entity_id: input_boolean.garden_rain_cancel
+            - action: persistent_notification.create
+              data:
+                notification_id: garden_rain_cancel
+                title: "🌧 Garden watering skipped"
+                message: >-
+                  Today's garden watering has been cancelled for all schedules.
+                  {% if rained_recently and (max_prob | int) >= (threshold | int) %}
+                  Reason: it rained in the last 12 h and rain is forecast
+                  (max {{ max_prob }}% in the next 24 h).
+                  {% elif rained_recently %}
+                  Reason: it rained in the last 12 h.
+                  {% else %}
+                  Reason: rain forecast (max {{ max_prob }}% in the next 24 h,
+                  threshold {{ threshold }}%).
+                  {% endif %}
+                  Press the Go button on a scheduler card to override and
+                  water anyway.
+
+# -------------------------------------------------------------------------
+# 3. DAILY RESET — clears the shared flag 30 min AFTER the LATEST schedule
+#    start so a rain skip (auto or manual) does not persist into the next day.
+# -------------------------------------------------------------------------
+- id: garden_rain_cancel_daily_reset
+  alias: Garden Rain Cancel Daily Reset
+  description: >-
+    Clears the shared garden_rain_cancel 30 min after the latest schedule start
+    time and dismisses the rain-skip notification, so a skip does not carry over
+    to the next day.
+  mode: single
+  triggers:
+    - trigger: time_pattern
+      minutes: "0"
+    - trigger: time_pattern
+      minutes: "30"
+  conditions:
+    - condition: state
+      entity_id: input_boolean.garden_rain_cancel
+      state: "on"
+    # now() - 30 min equals the LATEST of the schedules' start times.
+    - condition: template
+      value_template: >-
+        {% set ns = namespace(starts=[]) %}
+        {% for s in ['a','b'] %}
+          {% set st = states('input_select.garden_' ~ s ~ '_water_start_time') %}
+          {% if st not in ['unknown','unavailable',''] %}{% set ns.starts = ns.starts + [st] %}{% endif %}
+        {% endfor %}
+        {{ ns.starts | length > 0
+           and (now() - timedelta(minutes=30)).strftime('%H:%M') == (ns.starts | max) }}
+  actions:
+    - action: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.garden_rain_cancel
+    - action: persistent_notification.dismiss
+      data:
+        notification_id: garden_rain_cancel
