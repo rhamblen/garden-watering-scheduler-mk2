@@ -42,7 +42,9 @@ Per zone, in slot order 1 → 5 (skipping blank/0 slots):
 2. `timer.start` the valve's `timer.<prefix>_timer` for the zone duration.
 3. Wait for the valve to report `off` — by the valve card's `timer.finished`
    automation, a volume cutoff, a manual stop, or a fault — then move to the next zone.
-4. Backstop: if the valve is still open after `duration + 30 s`, mk2 force-closes it.
+4. Backstop: if the valve is still open after `duration + 30 s`, mk2 enters a retry loop —
+   force-closing every 15 s for up to **30 minutes (120 attempts)**. If the valve is still
+   on after all retries, `switch.garden_water_meter` is shut off as a last resort.
 
 There is **no fixed settle delay** between zones (mk1 needed one): waiting on the
 actual `→ off` state is the confirmation that the just-closed valve has propagated, so

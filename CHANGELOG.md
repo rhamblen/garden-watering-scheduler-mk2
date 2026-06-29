@@ -3,6 +3,19 @@
 All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.0] — 2026-06-29
+
+### Changed
+
+- **Backstop retry loop** — if a valve fails to close, mk2 now retries a force-close every
+  15 seconds for up to **30 minutes (120 attempts)** instead of making a single attempt and
+  moving on.
+- **Emergency water meter shutoff** — after 120 failed retries with the valve still reporting
+  `on`, `switch.garden_water_meter` is turned off as a last resort to stop flow at the
+  source. Applies to all three schedules (A, B, C).
+
+---
+
 ## [0.1.0] — 2026-06-20
 
 First release of the **mk2** scheduler — a re-architecture of
